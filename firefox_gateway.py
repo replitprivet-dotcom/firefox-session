@@ -1,7 +1,9 @@
 import os, re, secrets, time, json, subprocess
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse, Response
+import httpx
+import websockets
 from urllib.parse import parse_qs
 
 app = FastAPI(title='Firefox Session Gateway')
@@ -10,6 +12,7 @@ BASE_PORT = 6100
 PUBLIC_IP = os.getenv('PUBLIC_IP', '172.232.172.170')
 ADMIN_KEY = os.getenv('ADMIN_KEY', 'maha7788')
 IMAGE = 'jlesage/firefox:latest'
+BACKEND_HOST = os.getenv('BACKEND_HOST', 'host.docker.internal')
 
 def load():
     try: return json.loads(STATE.read_text())
@@ -48,7 +51,7 @@ def adduser(password: str, day: int=7, id: str='', key: str=''):
     name='fx-'+id
     docker('run','-d','--name',name,'--restart','unless-stopped','-p',f'{port}:5800','-p',f'{port+1000}:5900','-e',f'VNC_PASSWORD={password}','-e','WEB_HOST_CLIPBOARD_SYNC=0','-e','KEEP_APP_RUNNING=1','-e','DISPLAY_WIDTH=1280','-e','DISPLAY_HEIGHT=800','-v',f'fx_{id}_config:/config',IMAGE)
     s[id]={'token':token,'port':port,'vnc_port':port+1000,'expires':expires,'container':name,'password':password}; save(s)
-    link=f'http://{PUBLIC_IP}:6080/kaalix/firefoxwep__/{id}-{token}?host={PUBLIC_IP}&port={port}&path=websockify&autoconnect=true&resize=scale&noclipboard=1'
+    link=f'http://{PUBLIC_IP}:6080/kaalix/firefoxwep__/{id}-{token}/'
     return {'ok':True,'id':id,'expires_at':expires,'link':link,'vnc':f'{PUBLIC_IP}:{port+1000}'}
 
 @app.get('/delete')
@@ -69,14 +72,69 @@ def newpas(id: str, password: str, newpassword: str, key: str=''):
     docker('run','-d','--name',name,'--restart','unless-stopped','-p',f'{port}:5800','-p',f'{port+1000}:5900','-e',f'VNC_PASSWORD={newpassword}','-e','WEB_HOST_CLIPBOARD_SYNC=0','-e','KEEP_APP_RUNNING=1','-e','DISPLAY_WIDTH=1280','-e','DISPLAY_HEIGHT=800','-v',f'fx_{id}_config:/config',IMAGE)
     x['password']=newpassword; s[id]=x; save(s); return {'ok':True,'id':id,'password_changed':True}
 
-@app.get('/kaalix/firefoxwep__/{slug}')
-def session_link(slug: str, host: str='', port: int=0, path: str='websockify', autoconnect: str='true', resize: str='scale', noclipboard: str='1'):
+def find_session(slug: str):
     s = load()
     item = next((v for sid, v in s.items() if f'{sid}-{v.get("token", "")}' == slug), None)
     if not item or item['expires'] < int(time.time()):
         raise HTTPException(404, 'link expired or invalid')
-    target = f'http://{PUBLIC_IP}:{item["port"]}/?host={PUBLIC_IP}&port={item["port"]}&path=websockify&autoconnect=true&resize=scale&noclipboard=1'
-    return RedirectResponse(target, status_code=302)
+    return item
+
+
+@app.get('/kaalix/firefoxwep__/{slug}')
+async def session_root_no_slash(slug: str):
+    find_session(slug)
+    return RedirectResponse(f'/kaalix/firefoxwep__/{slug}/', status_code=307)
+
+
+@app.get('/kaalix/firefoxwep__/{slug}/')
+async def session_root(slug: str):
+    item = find_session(slug)
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f'http://{BACKEND_HOST}:{item["port"]}/')
+    headers = {k:v for k,v in r.headers.items() if k.lower() not in {'content-length','transfer-encoding','connection'}}
+    return Response(content=r.content, status_code=r.status_code, headers=headers, media_type=r.headers.get('content-type'))
+
+
+@app.api_route('/kaalix/firefoxwep__/{slug}/{subpath:path}', methods=['GET','HEAD','POST','PUT','DELETE','OPTIONS'])
+async def session_http_proxy(slug: str, subpath: str, request: Request):
+    item = find_session(slug)
+    body = await request.body()
+    target = f'http://{BACKEND_HOST}:{item["port"]}/{subpath}'
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.request(request.method, target, content=body, headers={k:v for k,v in request.headers.items() if k.lower() != 'host'}, params=request.query_params)
+    headers = {k:v for k,v in r.headers.items() if k.lower() not in {'content-length','transfer-encoding','connection'}}
+    return Response(content=r.content, status_code=r.status_code, headers=headers, media_type=r.headers.get('content-type'))
+
+
+@app.websocket('/kaalix/firefoxwep__/{slug}/{subpath:path}')
+async def session_ws_proxy(slug: str, subpath: str, websocket: WebSocket):
+    item = find_session(slug)
+    await websocket.accept()
+    target = f'ws://{BACKEND_HOST}:{item["port"]}/{subpath}'
+    try:
+        async with websockets.connect(target, max_size=None) as upstream:
+            async def browser_to_upstream():
+                while True:
+                    message = await websocket.receive()
+                    if message.get('type') == 'websocket.disconnect':
+                        break
+                    if message.get('text') is not None:
+                        await upstream.send(message['text'])
+                    elif message.get('bytes') is not None:
+                        await upstream.send(message['bytes'])
+            async def upstream_to_browser():
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+            import asyncio
+            await asyncio.gather(browser_to_upstream(), upstream_to_browser())
+    except Exception:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 @app.get('/')
 def root():
@@ -91,8 +149,8 @@ async def login(request: Request):
     s = load(); item = s.get(username)
     if not item or item.get('password') != password or item.get('expires', 0) < int(time.time()):
         return HTMLResponse('<p>Invalid username or password. <a href="/">Try again</a></p>', status_code=401)
-    target = f'http://{PUBLIC_IP}:{item["port"]}/?host={PUBLIC_IP}&port={item["port"]}&path=websockify&autoconnect=true&resize=scale&noclipboard=1'
-    return RedirectResponse(target, status_code=303)
+    slug = next((sid for sid, value in s.items() if value is item), '')
+    return RedirectResponse(f'/kaalix/firefoxwep__/{slug}-{item["token"]}/', status_code=303)
 
 
 @app.get('/health')
